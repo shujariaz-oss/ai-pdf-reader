@@ -32,7 +32,7 @@ def safe_get_db_connection():
     try:
         return psycopg2.connect(DATABASE_URL)
     except Exception as e:
-        print(f"Database connection log bypass: {str(e)}")
+        print(f"Database connection bypass: {str(e)}")
         return None
 
 @app.post("/api/upload")
@@ -42,7 +42,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     try:
         images = convert_from_bytes(file_bytes)
-        print(f"[UPLOAD] PDF broken down into {len(images)} pages.")
+        print(f"[UPLOAD] PDF parsed into {len(images)} pages.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse PDF pages: {str(e)}")
     
@@ -111,7 +111,6 @@ def fallback_tesseract(img):
     except Exception:
         return "[OCR Extraction Failed]"
 
-# Raw Request handling completely bypasses strict 422 structural errors
 @app.post("/api/translate")
 async def translate_text(request: Request):
     print("\n[TRANSLATE] Inbound request intercepted.")
@@ -120,13 +119,25 @@ async def translate_text(request: Request):
     except Exception:
         body = {}
 
-    # Extract any possible casing standard sent by the frontend automatically
+    print(f"[TRANSLATE] Full payload received: {body}")
+
+    # 1. Try standard keys
     target_lang = body.get("target_lang") or body.get("targetLang") or "English"
     source_text = body.get("source_text") or body.get("sourceText") or body.get("text") or body.get("extracted_text") or body.get("extractedText") or ""
     target_id = body.get("doc_id") or body.get("docId") or body.get("document_id") or body.get("documentId") or body.get("id")
 
-    # If text is empty but an ID exists, fetch safely from database
+    # 2. AUTO-DETECT FALLBACK SCANNER: If standard text keys are empty, search through the data structure
+    if not source_text:
+        for key, val in body.items():
+            if isinstance(val, str) and len(val) > 15 and key not in ["target_lang", "targetLang"]:
+                source_text = val
+                print(f"[AUTO-DETECT] Caught source text inside unexpected frontend variable: '{key}'")
+                break
+
+    # 3. DATABASE RECORD FALLBACK CHECK
+    db_status = "Not attempted (Text already found)"
     if not source_text and target_id:
+        db_status = "Attempted but failed to connect"
         conn = safe_get_db_connection()
         if conn:
             try:
@@ -135,31 +146,33 @@ async def translate_text(request: Request):
                 row = cur.fetchone()
                 if row:
                     source_text = row[0]
+                    db_status = "Successfully loaded text from database"
+                else:
+                    db_status = f"Database connected, but ID '{target_id}' was not found"
                 cur.close()
                 conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                db_status = f"Database error encountered: {str(e)}"
 
+    # 4. IF STILL COMPLETELY EMPTY, SEND BACK DIAGNOSTIC REVELATION
     if not source_text:
+        frontend_keys = list(body.keys())
         return {
-            "translatedText": "[No text context found to translate]",
-            "translated_text": "[No text context found to translate]",
-            "translation": "[No text context found to translate]",
-            "text": "[No text context found to translate]"
+            "translatedText": f"[Diagnostic Log -> Keys Sent by Frontend: {frontend_keys} | DB Status: {db_status}]",
+            "translated_text": f"[Diagnostic Log -> Keys Sent by Frontend: {frontend_keys} | DB Status: {db_status}]",
+            "text": "[Payload Extraction Empty]"
         }
 
-    # Verify API key status instantly before hitting loops
     if not GEMINI_API_KEY:
         return {
-            "translatedText": "[Error: GEMINI_API_KEY is not configured in your Render Environment Variables]",
-            "translated_text": "[Error: GEMINI_API_KEY is not configured in your Render Environment Variables]",
-            "text": "[Error: GEMINI_API_KEY missing]"
+            "translatedText": "[Error: GEMINI_API_KEY is missing from Render environment variables]",
+            "translated_text": "[Error: GEMINI_API_KEY is missing from Render environment variables]",
+            "text": "[Missing API Key]"
         }
 
     translated_text = None
     api_error_log = "Unknown Model Error"
 
-    # Route request across production cloud gateways
     for model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -181,10 +194,9 @@ async def translate_text(request: Request):
             "translation": translated_text, "text": translated_text
         }
     else:
-        # Transparent error delivery so you can see exact cause on screen
         return {
-            "translatedText": f"[Translation Failed. System Log: {api_error_log}]",
-            "translated_text": f"[Translation Failed. System Log: {api_error_log}]",
+            "translatedText": f"[Translation Gateway Error: {api_error_log}]",
+            "translated_text": f"[Translation Gateway Error: {api_error_log}]",
             "text": "[Execution Failure]"
         }
 
