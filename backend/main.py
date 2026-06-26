@@ -1,12 +1,25 @@
+import os
+import io
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from models import TranslationRequest, CorrectionRequest
-from database import get_db_connection
-from ocr import extract_text_from_pdf
-from translation import translate_text, LANGUAGE_CODE_MAP
+from pydantic import BaseModel
+import psycopg2
+from PIL import Image
+from pdf2image import convert_from_bytes
 
-app = FastAPI(title="Self-Learning PDF Translator Core API")
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+app = FastAPI()
+
+# Enable cross-origin resource sharing for your Vercel frontend interface
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,116 +28,142 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if GEMINI_API_KEY and genai:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL configuration is missing on the server tier.")
+    return psycopg2.connect(DATABASE_URL)
+
+class TranslationRequest(BaseModel):
+    doc_id: str
+    target_lang: str
+
+class CorrectionRequest(BaseModel):
+    original_text: str
+    corrected_translation: str
+    target_lang: str
+
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Invalid extension file framework. Requires PDF.")
+    file_bytes = await file.read()
     
     try:
-        file_bytes = await file.read()
-        extracted_text = extract_text_from_pdf(file_bytes)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO documents (filename, extracted_text) VALUES (%s, %s) RETURNING id",
-            (file.filename, extracted_text)
-        )
-        doc_id = cursor.fetchone()['id']
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
-        return {"doc_id": str(doc_id), "extracted_text": extracted_text}
+        images = convert_from_bytes(file_bytes)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal Parser Error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to process target PDF layout: {str(e)}")
+    
+    full_text = ""
+    
+    for i, img in enumerate(images):
+        full_text += f"\n--- PAGE {i+1} ---\n"
+        
+        # Route to Gemini Cloud Vision Engine if configured (Prevents Render RAM failure)
+        if GEMINI_API_KEY and genai:
+            try:
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG')
+                img_bytes = img_byte_arr.getvalue()
+                
+                response = model.generate_content([
+                    "Transcribe all handwritten and printed layout text from this mindmap infographic accurately. Keep contextual points together grouped by proximity.",
+                    {"mime_type": "image/jpeg", "data": img_bytes}
+                ])
+                full_text += response.text + "\n"
+            except Exception:
+                full_text += fallback_tesseract(img)
+        else:
+            full_text += fallback_tesseract(img)
+            
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO documents (file_name, source_text) VALUES (%s, %s) RETURNING id;",
+            (file.filename, full_text)
+        )
+        doc_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        return {"doc_id": "temp_pipeline_id", "source_text": full_text}
+
+    return {"doc_id": str(doc_id), "source_text": full_text}
+
+def fallback_tesseract(img):
+    if not pytesseract:
+        return "[Local Engine Timeout]"
+    try:
+        max_size = 1500
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCEZOS)
+        custom_config = r'--psm 11 --oem 3'
+        return pytesseract.image_to_string(img, config=custom_config)
+    except Exception:
+        return "[Layout Reading Interrupted]"
 
 @app.post("/api/translate")
-async def trigger_translation(payload: TranslationRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        "SELECT translated_text FROM translations WHERE document_id = %s AND target_lang = %s",
-        (payload.doc_id, payload.target_lang)
-    )
-    existing = cursor.fetchone()
-    if existing:
-        cursor.close()
-        conn.close()
-        return {"translated_text": existing['translated_text']}
-        
-    cursor.execute("SELECT extracted_text FROM documents WHERE id = %s", (payload.doc_id,))
-    doc_record = cursor.fetchone()
-    if not doc_record:
-        cursor.close()
-        conn.close()
-        raise HTTPException(status_code=404, detail="Target document container context not found.")
-        
-    try:
-        computed_translation = translate_text(doc_record['extracted_text'], payload.target_lang)
-        cursor.execute(
-            "INSERT INTO translations (document_id, target_lang, translated_text) VALUES (%s, %s, %s)",
-            (payload.doc_id, payload.target_lang, computed_translation)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return {"translated_text": computed_translation}
-    except Exception as e:
-        cursor.close()
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Translation Subsystem Error: {str(e)}")
-
-@app.post("/api/correction")
-async def save_correction(payload: CorrectionRequest):
+async def translate_text(req: TranslationRequest):
+    source_text = ""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        target_code = LANGUAGE_CODE_MAP.get(payload.target_lang.lower(), payload.target_lang.lower())
-        cursor.execute(
-            "INSERT INTO corrections (original_text, corrected_translation, target_lang) VALUES (%s, %s, %s)",
-            (payload.original_text.strip(), payload.corrected_translation.strip(), target_code)
+        cur = conn.cursor()
+        cur.execute("SELECT source_text FROM documents WHERE id = %s;", (req.doc_id,))
+        row = cur.fetchone()
+        if row:
+            source_text = row[0]
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+    if not source_text:
+        raise HTTPException(status_code=404, detail="Requested file context is currently unreadable.")
+
+    memory_context = ""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT original_text, corrected_translation FROM corrections WHERE target_lang = %s LIMIT 10;", (req.target_lang,))
+        rows = cur.fetchall()
+        if rows:
+            memory_context = "Adhere strictly to the style adjustments from these past corrections provided by the user:\n"
+            for r in rows:
+                memory_context += f"Source Segment: '{r[0]}' -> Map to translation output: '{r[1]}'\n"
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+    if GEMINI_API_KEY and genai:
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"Translate the following raw structural text directly into {req.target_lang}. Preserve line numbers and layout codes like ''. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
+            response = model.generate_content(prompt)
+            return {"translated_text": response.text}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Translation failure: {str(e)}")
+    else:
+        return {"translated_text": "[API Activation Pending]:\n" + source_text}
+
+@app.post("/api/correction")
+async def save_correction(req: CorrectionRequest):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO corrections (original_text, corrected_translation, target_lang) VALUES (%s, %s, %s);",
+            (req.original_text, req.corrected_translation, req.target_lang)
         )
         conn.commit()
-        cursor.close()
+        cur.close()
         conn.close()
-        return {"status": "success"}
+        return {"status": "memory_saved"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/history")
-async def get_history_ledger():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, created_at FROM documents ORDER BY created_at DESC")
-    records = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return records
-
-@app.get("/api/document/{doc_id}")
-async def get_document(doc_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, extracted_text, created_at FROM documents WHERE id = %s", (doc_id,))
-    doc = cursor.fetchone()
-    if not doc:
-        cursor.close()
-        conn.close()
-        raise HTTPException(status_code=404, detail="Document not found.")
-    cursor.execute("SELECT target_lang, translated_text FROM translations WHERE document_id = %s", (doc_id,))
-    translations = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return {"document": doc, "translations": {t['target_lang']: t['translated_text'] for t in translations}}
-
-@app.delete("/api/document/{doc_id}")
-async def delete_document(doc_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return {"status": "success"}
+        raise HTTPException(status_code=500, detail=f"Memory Sync failed: {str(e)}")
