@@ -72,7 +72,8 @@ async def upload_pdf(file: UploadFile = File(...)):
                 base64_image = base64.b64encode(img_bytes).decode('utf-8')
                 print(f"Page {i+1} image optimized and encoded into Base64 format.")
                 
-                url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                # ROUTE ROUTING TO ACTIVE STABLE CORE ENDPOINT
+                url = f"https://generativelanguage.googleapis.com/v1/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
                 headers = {'Content-Type': 'application/json'}
                 payload = {
                     "contents": [{
@@ -195,7 +196,8 @@ async def translate_text(req: TranslationRequest):
 
     if GEMINI_API_KEY:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            # ROUTE TRANSLATION STEP TO ACTIVE STABLE CORE ENDPOINT
+            url = f"https://generativelanguage.googleapis.com/v1/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
             headers = {'Content-Type': 'application/json'}
             prompt = f"Translate the following text directly into {req.target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
             
