@@ -38,6 +38,8 @@ class TranslationRequest(BaseModel):
     document_id: str | None = None
     id: str | None = None
     target_lang: str
+    text: str | None = None
+    source_text: str | None = None
 
 class CorrectionRequest(BaseModel):
     original_text: str
@@ -72,7 +74,6 @@ async def upload_pdf(file: UploadFile = File(...)):
                 base64_image = base64.b64encode(img_bytes).decode('utf-8')
                 print(f"Page {i+1} image optimized and encoded into Base64 format.")
                 
-                # FIXED: Swapped v1 to v1beta, and updated model string to gemini-3.5-flash
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
                 headers = {'Content-Type': 'application/json'}
                 payload = {
@@ -159,25 +160,35 @@ def fallback_tesseract(img):
 
 @app.post("/api/translate")
 async def translate_text(req: TranslationRequest):
+    print(f"\n[START] Received translation request for target language: {req.target_lang}")
+    
+    # ADVANCED RESILIENCE: Check if direct payload text is provided before falling back to DB lookup
+    source_text = req.source_text or req.text or ""
     target_id = req.doc_id or req.document_id or req.id
-    if not target_id:
-        raise HTTPException(status_code=422, detail="Missing document identification reference mapping.")
+    
+    print(f"Context Parameters -> ID: {target_id}, Direct Payload Text Length: {len(source_text)}")
 
-    source_text = ""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT source_text FROM documents WHERE id = %s;", (target_id,))
-        row = cur.fetchone()
-        if row:
-            source_text = row[0]
-        cur.close()
-        conn.close()
-    except Exception:
-        pass
+    if not source_text and target_id:
+        print(f"No direct inline text found. Pulling context from PostgreSQL database for ID: {target_id}")
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT source_text FROM documents WHERE id = %s;", (target_id,))
+            row = cur.fetchone()
+            if row:
+                source_text = row[0]
+                print(f"Database record sync complete. Loaded {len(source_text)} context characters.")
+            else:
+                print(f"Database lookup yielded no records for entry ID: {target_id}")
+            cur.close()
+            conn.close()
+        except Exception as db_err:
+            print(f"Database execution exception intercepted: {str(db_err)}")
+            pass
 
     if not source_text:
-        raise HTTPException(status_code=404, detail="No readable source context found.")
+        print("CRITICAL: Translation payload evaluation halted. Source text block context is entirely empty.")
+        raise HTTPException(status_code=400, detail="No readable source context found for translation pipeline.")
 
     memory_context = ""
     try:
@@ -196,7 +207,6 @@ async def translate_text(req: TranslationRequest):
 
     if GEMINI_API_KEY:
         try:
-            # FIXED: Swapped v1 to v1beta, and updated model string to gemini-3.5-flash here too
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
             headers = {'Content-Type': 'application/json'}
             prompt = f"Translate the following text directly into {req.target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
@@ -207,21 +217,27 @@ async def translate_text(req: TranslationRequest):
                 }]
             }
             
+            print("Dispatching translation text sequence bundle to Google Gemini core...")
             response = requests.post(url, headers=headers, json=payload, timeout=30)
+            print(f"Google Core Server translation response code: {response.status_code}")
             
             if response.status_code == 200:
                 res_data = response.json()
                 translated_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                print(f"Translation successful. Generated {len(translated_text)} output units.")
                 return {
                     "translated_text": translated_text,
                     "text": translated_text,
                     "translation": translated_text
                 }
             else:
-                raise HTTPException(status_code=500, detail=f"Gemini API translation error: {response.text}")
+                print(f"Google Core rejected translation request: {response.text}")
+                raise HTTPException(status_code=500, detail=f"Gemini API translation error code {response.status_code}: {response.text}")
         except Exception as e:
+            print(f"Network processing core pipeline exception occurred: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Translation connection failure: {str(e)}")
     else:
+        print("LOG ERROR: GEMINI_API_KEY target variable missing during compilation runtime.")
         return {
             "translated_text": "[API Activation Pending Environment Variable Verification]",
             "text": "[API Activation Pending]"
