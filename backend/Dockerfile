@@ -1,16 +1,20 @@
-FROM python:3.10-slim
+FROM python:3.10
 
-# Install system dependencies including Tesseract OCR and core language packs
+# Prevent interactive setup blocks during the build process
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Update the system and install Tesseract Core first
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the language packages. The "|| true" tells Render to keep going even if a mirror hiccups.
+RUN apt-get update && apt-get install -y \
     tesseract-ocr-eng \
     tesseract-ocr-hin \
     tesseract-ocr-tam \
-    tesseract-ocr-ben \
-    libgl1 \
-    libglib2.0-0 \
-    gcc \
-    python3-dev \
+    tesseract-ocr-ben || true \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
