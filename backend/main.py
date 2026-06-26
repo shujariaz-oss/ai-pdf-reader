@@ -29,7 +29,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 def get_db_connection():
     if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL configuration is missing on the server tier.")
+        print("LOG ERROR: DATABASE_URL variable is empty!")
+        raise HTTPException(status_code=500, detail="DATABASE_URL configuration missing.")
     return psycopg2.connect(DATABASE_URL)
 
 class TranslationRequest(BaseModel):
@@ -45,27 +46,32 @@ class CorrectionRequest(BaseModel):
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    print(f"\n[START] Received file upload request for: {file.filename}")
     file_bytes = await file.read()
+    print(f"Read {len(file_bytes)} bytes from inbound payload.")
     
     try:
+        print("Attempting to slice PDF pages into image sequences via pdf2image...")
         images = convert_from_bytes(file_bytes)
+        print(f"Success! Fragmented PDF layout into {len(images)} separate pages.")
     except Exception as e:
+        print(f"CRITICAL LOG ERROR: pdf2image compilation split failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to process target PDF layout: {str(e)}")
     
     full_text = ""
     
     for i, img in enumerate(images):
+        print(f"--- Processing Content Extraction Matrix for Page {i+1} ---")
         full_text += f"\n--- PAGE {i+1} ---\n"
         
         if GEMINI_API_KEY:
             try:
-                # Safely convert the image to base64 layout data string
                 img_byte_arr = io.BytesIO()
                 img.save(img_byte_arr, format='JPEG')
                 img_bytes = img_byte_arr.getvalue()
                 base64_image = base64.b64encode(img_bytes).decode('utf-8')
+                print(f"Page {i+1} image optimized and encoded into Base64 format.")
                 
-                # Directly call Google's stable v1 core REST endpoint
                 url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
                 headers = {'Content-Type': 'application/json'}
                 payload = {
@@ -82,26 +88,33 @@ async def upload_pdf(file: UploadFile = File(...)):
                     }]
                 }
                 
+                print(f"Dispatching direct REST request payload to Google Core APIs for Page {i+1}...")
                 response = requests.post(url, headers=headers, json=payload, timeout=30)
+                print(f"Google Server responded with HTTP status check: {response.status_code}")
                 
                 if response.status_code == 200:
                     res_data = response.json()
                     page_text = res_data['candidates'][0]['content']['parts'][0]['text']
                     full_text += page_text + "\n"
+                    print(f"Successfully extracted {len(page_text)} layout characters for Page {i+1}.")
                 else:
+                    print(f"API rejection notice on Page {i+1}: {response.text}")
                     full_text += f"[Gemini Cloud Core Error {response.status_code}: {response.text}]\n"
                     full_text += "--- Attempting Local Backup Engine ---\n"
                     full_text += fallback_tesseract(img)
                     
             except Exception as e:
+                print(f"Pipeline intercept connection exception on Page {i+1}: {str(e)}")
                 full_text += f"[Connection Interrupted: {str(e)}]\n"
                 full_text += fallback_tesseract(img)
         else:
+            print("LOG WARNING: GEMINI_API_KEY environment lookup variable is unassigned.")
             full_text += "[Gemini API Key missing in Server Settings]\n"
             full_text += fallback_tesseract(img)
             
     doc_id = "temp_pipeline_id"
     try:
+        print("Syncing extracted document matrix into PostgreSQL tracking system...")
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -112,9 +125,12 @@ async def upload_pdf(file: UploadFile = File(...)):
         conn.commit()
         cur.close()
         conn.close()
-    except Exception:
+        print(f"Database serialization successful. Generated tracking signature ID: {doc_id}")
+    except Exception as db_err:
+        print(f"Database logging pass-through notification: {str(db_err)}")
         pass
 
+    print("[COMPLETE] Sending universal response payload matrix back to frontend UI tier.")
     return {
         "doc_id": str(doc_id),
         "document_id": str(doc_id),
@@ -125,6 +141,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 def fallback_tesseract(img):
+    print("Executing fallback tesseract logic...")
     if not pytesseract:
         return "[Local Engine Utility Missing]"
     try:
@@ -136,6 +153,7 @@ def fallback_tesseract(img):
         custom_config = r'--psm 11 --oem 3'
         return pytesseract.image_to_string(img, config=custom_config)
     except Exception as e:
+        print(f"Fallback Tesseract component execution crash: {str(e)}")
         return f"[Local Engine Backup Failed: {str(e)}]"
 
 @app.post("/api/translate")
