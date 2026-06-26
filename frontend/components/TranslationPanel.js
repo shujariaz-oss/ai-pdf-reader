@@ -13,7 +13,8 @@ export default function TranslationPanel({ docId, sourceText }) {
 
   const cleanSplit = (text) => {
     if (!text) return [];
-    return text.split(/(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s/).filter(s => s.strip());
+    // Using standard split pattern and native JavaScript .trim()
+    return text.split(/(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s/).filter(s => s.trim());
   };
 
   useEffect(() => {
