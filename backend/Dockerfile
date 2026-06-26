@@ -3,13 +3,14 @@ FROM python:3.10
 # Prevent interactive setup blocks during the build process
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Update the system and install Tesseract Core first
+# Update the system and install Tesseract, Poppler (for PDF processing), and core libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
+    poppler-utils \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the language packages. The "|| true" tells Render to keep going even if a mirror hiccups.
+# Install optional language packages for local fallback processing
 RUN apt-get update && apt-get install -y \
     tesseract-ocr-eng \
     tesseract-ocr-hin \
