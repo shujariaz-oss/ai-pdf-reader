@@ -31,10 +31,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if GEMINI_API_KEY and genai:
-    print("Initializing Gemini configuration...")
     genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("WARNING: GEMINI_API_KEY environment variable is missing or empty!")
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -59,7 +56,6 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         images = convert_from_bytes(file_bytes)
     except Exception as e:
-        print(f"Poppler PDF conversion crash: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to process target PDF layout: {str(e)}")
     
     full_text = ""
@@ -69,18 +65,25 @@ async def upload_pdf(file: UploadFile = File(...)):
         
         if GEMINI_API_KEY and genai:
             try:
-                # Direct PIL image native passing (highly stable)
                 model = genai.GenerativeModel('gemini-1.5-flash')
+                
+                # Convert PIL image safely to raw bytes for cross-version cloud stability
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG')
+                img_bytes = img_byte_arr.getvalue()
+                
                 response = model.generate_content([
-                    "Transcribe all handwritten and printed layout text from this mindmap infographic accurately. Keep contextual points together grouped by proximity.",
-                    img
+                    "Transcribe all handwritten and printed layout text from this document page clearly and accurately. Keep contextual points together.",
+                    {"mime_type": "image/jpeg", "data": img_bytes}
                 ])
                 full_text += response.text + "\n"
             except Exception as gemini_err:
-                # Print the exact error to Render log dashboard
-                print(f"CRITICAL: Gemini Vision failed on page {i+1}. Error: {gemini_err}")
+                # Instead of hiding the cloud error, display it directly to diagnose setup issues
+                full_text += f"[Gemini Cloud Error: {str(gemini_err)}]\n"
+                full_text += "--- Attempting Local Backup Engine ---\n"
                 full_text += fallback_tesseract(img)
         else:
+            full_text += "[Gemini API Key missing in Render Environment Setup]\n"
             full_text += fallback_tesseract(img)
             
     doc_id = "temp_pipeline_id"
@@ -95,8 +98,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         conn.commit()
         cur.close()
         conn.close()
-    except Exception as db_err:
-        print(f"Database save skipped: {db_err}")
+    except Exception:
+        pass
 
     return {
         "doc_id": str(doc_id),
@@ -109,19 +112,20 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 def fallback_tesseract(img):
     if not pytesseract:
-        return "[Local Engine Missing]"
+        return "[Local Engine Utility Missing]"
     try:
-        # Explicitly configure default Linux system paths for Render environment
         if os.path.exists('/usr/bin/tesseract'):
             pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
             
+        # Completely removed the LANCEZOS parameter keyword to avoid library crashes
         max_size = 1500
         if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCEZOS)
+            img.thumbnail((max_size, max_size))
+            
         custom_config = r'--psm 11 --oem 3'
         return pytesseract.image_to_string(img, config=custom_config)
     except Exception as e:
-        return f"[Layout Reading Interrupted: {str(e)}]"
+        return f"[Local Engine Backup Failed: {str(e)}]"
 
 @app.post("/api/translate")
 async def translate_text(req: TranslationRequest):
@@ -142,8 +146,8 @@ async def translate_text(req: TranslationRequest):
     except Exception:
         pass
 
-    if not source_text or "[Layout Reading Interrupted" in source_text:
-        source_text = "Please fix the text extraction phase first before submitting translations."
+    if not source_text:
+        raise HTTPException(status_code=404, detail="No readable source context found.")
 
     memory_context = ""
     try:
@@ -163,7 +167,7 @@ async def translate_text(req: TranslationRequest):
     if GEMINI_API_KEY and genai:
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
-            prompt = f"Translate the following raw structural text directly into {req.target_lang}. Preserve line numbers and layout codes like ''. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
+            prompt = f"Translate the following text directly into {req.target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
             response = model.generate_content(prompt)
             return {
                 "translated_text": response.text,
@@ -171,7 +175,6 @@ async def translate_text(req: TranslationRequest):
                 "translation": response.text
             }
         except Exception as e:
-            print(f"Gemini Translation Route Crash: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Translation failure: {str(e)}")
     else:
         return {
