@@ -33,18 +33,28 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail="DATABASE_URL configuration missing.")
     return psycopg2.connect(DATABASE_URL)
 
+# Dual-cased insulation model to eliminate 422 schema mismatch crashes
 class TranslationRequest(BaseModel):
     doc_id: str | None = None
+    docId: str | None = None
     document_id: str | None = None
+    documentId: str | None = None
     id: str | None = None
-    target_lang: str
+    target_lang: str | None = None
+    targetLang: str | None = None
     text: str | None = None
     source_text: str | None = None
+    sourceText: str | None = None
+    extracted_text: str | None = None
+    extractedText: str | None = None
 
 class CorrectionRequest(BaseModel):
-    original_text: str
-    corrected_translation: str
-    target_lang: str
+    original_text: str | None = None
+    originalText: str | None = None
+    corrected_translation: str | None = None
+    correctedTranslation: str | None = None
+    target_lang: str | None = None
+    targetLang: str | None = None
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -74,44 +84,49 @@ async def upload_pdf(file: UploadFile = File(...)):
                 base64_image = base64.b64encode(img_bytes).decode('utf-8')
                 print(f"Page {i+1} image optimized and encoded into Base64 format.")
                 
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
-                headers = {'Content-Type': 'application/json'}
-                payload = {
-                    "contents": [{
-                        "parts": [
-                            {"text": "Transcribe all handwritten and printed layout text from this document page clearly and accurately. Keep contextual points together."},
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/jpeg",
-                                    "data": base64_image
-                                }
-                            }
-                        ]
-                    }]
-                }
+                page_extracted = False
+                # Cascading model verification loop for extraction
+                for model in ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-1.5-flash"]:
+                    try:
+                        print(f"Attempting OCR processing with runtime matrix: {model}")
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                        headers = {'Content-Type': 'application/json'}
+                        payload = {
+                            "contents": [{
+                                "parts": [
+                                    {"text": "Transcribe all handwritten and printed layout text from this document page clearly and accurately. Keep contextual points together."},
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/jpeg",
+                                            "data": base64_image
+                                        }
+                                    }
+                                ]
+                            }]
+                        }
+                        
+                        response = requests.post(url, headers=headers, json=payload, timeout=30)
+                        if response.status_code == 200:
+                            res_data = response.json()
+                            page_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                            full_text += page_text + "\n"
+                            page_extracted = True
+                            print(f"Successfully extracted page {i+1} using matrix: {model}")
+                            break
+                        else:
+                            print(f"Model matrix operational reject ({model}): Status {response.status_code}")
+                    except Exception as model_err:
+                        print(f"Model matrix execution cycle failure ({model}): {str(model_err)}")
                 
-                print(f"Dispatching direct REST request payload to Google Core APIs for Page {i+1}...")
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
-                print(f"Google Server responded with HTTP status check: {response.status_code}")
-                
-                if response.status_code == 200:
-                    res_data = response.json()
-                    page_text = res_data['candidates'][0]['content']['parts'][0]['text']
-                    full_text += page_text + "\n"
-                    print(f"Successfully extracted {len(page_text)} layout characters for Page {i+1}.")
-                else:
-                    print(f"API rejection notice on Page {i+1}: {response.text}")
-                    full_text += f"[Gemini Cloud Core Error {response.status_code}: {response.text}]\n"
-                    full_text += "--- Attempting Local Backup Engine ---\n"
+                if not page_extracted:
+                    print(f"All cloud model components exhausted for page {i+1}. Deploying local engine fallback.")
                     full_text += fallback_tesseract(img)
                     
             except Exception as e:
                 print(f"Pipeline intercept connection exception on Page {i+1}: {str(e)}")
-                full_text += f"[Connection Interrupted: {str(e)}]\n"
                 full_text += fallback_tesseract(img)
         else:
             print("LOG WARNING: GEMINI_API_KEY environment lookup variable is unassigned.")
-            full_text += "[Gemini API Key missing in Server Settings]\n"
             full_text += fallback_tesseract(img)
             
     doc_id = "temp_pipeline_id"
@@ -132,12 +147,16 @@ async def upload_pdf(file: UploadFile = File(...)):
         print(f"Database logging pass-through notification: {str(db_err)}")
         pass
 
-    print("[COMPLETE] Sending universal response payload matrix back to frontend UI tier.")
+    print("[COMPLETE] Sending complete response payload matrix back to frontend UI tier.")
     return {
+        "docId": str(doc_id),
         "doc_id": str(doc_id),
+        "documentId": str(doc_id),
         "document_id": str(doc_id),
         "id": str(doc_id),
+        "sourceText": full_text,
         "source_text": full_text,
+        "extractedText": full_text,
         "extracted_text": full_text,
         "text": full_text
     }
@@ -160,13 +179,18 @@ def fallback_tesseract(img):
 
 @app.post("/api/translate")
 async def translate_text(req: TranslationRequest):
-    print(f"\n[START] Received translation request for target language: {req.target_lang}")
+    print(f"\n[START] Received inbound translation request payload analysis.")
     
-    # ADVANCED RESILIENCE: Check if direct payload text is provided before falling back to DB lookup
-    source_text = req.source_text or req.text or ""
-    target_id = req.doc_id or req.document_id or req.id
+    # Normalize naming variables across both frontend casing standards
+    target_lang = req.target_lang or req.targetLang
+    source_text = req.source_text or req.sourceText or req.text or req.extracted_text or req.extractedText or ""
+    target_id = req.doc_id or req.docId or req.document_id or req.documentId or req.id
     
-    print(f"Context Parameters -> ID: {target_id}, Direct Payload Text Length: {len(source_text)}")
+    print(f"Context Parameters -> ID: {target_id}, Target Language: {target_lang}, Extraction Stream Unit Size: {len(source_text)}")
+
+    if not target_lang:
+        print("CRITICAL: Aborting pipeline. Destination language structural data missing.")
+        raise HTTPException(status_code=400, detail="Missing target language parameter (target_lang or targetLang)")
 
     if not source_text and target_id:
         print(f"No direct inline text found. Pulling context from PostgreSQL database for ID: {target_id}")
@@ -178,8 +202,6 @@ async def translate_text(req: TranslationRequest):
             if row:
                 source_text = row[0]
                 print(f"Database record sync complete. Loaded {len(source_text)} context characters.")
-            else:
-                print(f"Database lookup yielded no records for entry ID: {target_id}")
             cur.close()
             conn.close()
         except Exception as db_err:
@@ -194,7 +216,7 @@ async def translate_text(req: TranslationRequest):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT original_text, corrected_translation FROM corrections WHERE target_lang = %s LIMIT 10;", (req.target_lang,))
+        cur.execute("SELECT original_text, corrected_translation FROM corrections WHERE target_lang = %s LIMIT 10;", (target_lang,))
         rows = cur.fetchall()
         if rows:
             memory_context = "Adhere strictly to style adjustments from these past corrections:\n"
@@ -205,52 +227,60 @@ async def translate_text(req: TranslationRequest):
     except Exception:
         pass
 
+    translated_text = None
     if GEMINI_API_KEY:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
-            headers = {'Content-Type': 'application/json'}
-            prompt = f"Translate the following text directly into {req.target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
-            
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }]
-            }
-            
-            print("Dispatching translation text sequence bundle to Google Gemini core...")
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            print(f"Google Core Server translation response code: {response.status_code}")
-            
-            if response.status_code == 200:
-                res_data = response.json()
-                translated_text = res_data['candidates'][0]['content']['parts'][0]['text']
-                print(f"Translation successful. Generated {len(translated_text)} output units.")
-                return {
-                    "translated_text": translated_text,
-                    "text": translated_text,
-                    "translation": translated_text
+        # Multi-tiered fallback stack to clear runtime endpoint blocking
+        for model in ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-1.5-flash"]:
+            try:
+                print(f"Initiating translation engine path: {model}")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                headers = {'Content-Type': 'application/json'}
+                prompt = f"Translate the following text directly into {target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
+                
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }]
                 }
-            else:
-                print(f"Google Core rejected translation request: {response.text}")
-                raise HTTPException(status_code=500, detail=f"Gemini API translation error code {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"Network processing core pipeline exception occurred: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Translation connection failure: {str(e)}")
-    else:
-        print("LOG ERROR: GEMINI_API_KEY target variable missing during compilation runtime.")
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    translated_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                    print(f"Translation logic compiled successfully via: {model}")
+                    break
+                else:
+                    print(f"Model processing runtime rejected ({model}): Status {response.status_code}")
+            except Exception as e:
+                print(f"Model processing routing failure ({model}): {str(e)}")
+                
+    if translated_text:
+        # Map output schemas to cover both camelCase and snake_case UI hooks
         return {
-            "translated_text": "[API Activation Pending Environment Variable Verification]",
-            "text": "[API Activation Pending]"
+            "translatedText": translated_text,
+            "translated_text": translated_text,
+            "translation": translated_text,
+            "text": translated_text
         }
+    else:
+        print("CRITICAL LOG ERROR: Core structural engine failure. All available model endpoints rejected payload.")
+        raise HTTPException(status_code=500, detail="All Gemini translation model attempts exhausted or failed.")
 
 @app.post("/api/correction")
 async def save_correction(req: CorrectionRequest):
+    orig = req.original_text or req.originalText
+    corr = req.corrected_translation or req.correctedTranslation
+    lang = req.target_lang or req.targetLang
+    
+    if not orig or not corr or not lang:
+        raise HTTPException(status_code=400, detail="Missing required parameters for correction saving.")
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO corrections (original_text, corrected_translation, target_lang) VALUES (%s, %s, %s);",
-            (req.original_text, req.corrected_translation, req.target_lang)
+            (orig, corr, lang)
         )
         conn.commit()
         cur.close()
