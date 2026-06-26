@@ -27,7 +27,7 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# FAIL-SAFE IN-MEMORY CACHE (Bypasses broken database connections completely)
+# FAIL-SAFE IN-MEMORY CACHE
 DOCUMENT_CACHE = {}
 
 def safe_get_db_connection():
@@ -56,7 +56,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         
         if GEMINI_API_KEY:
             page_extracted = False
-            for model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+            # Updated 2026 Active Production Model List
+            for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
                 try:
                     img_byte_arr = io.BytesIO()
                     img.save(img_byte_arr, format='JPEG')
@@ -84,14 +85,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         else:
             full_text += fallback_tesseract(img)
             
-    # Generate a unique tracking ID for this session
     generated_id = str(uuid.uuid4())[:8]
-    
-    # Save directly to the fail-safe memory cache instantly
     DOCUMENT_CACHE[generated_id] = full_text
-    print(f"[CACHE] Successfully stored {len(full_text)} characters under memory key: {generated_id}")
+    print(f"[CACHE] Stored document under memory key: {generated_id}")
     
-    # Optional background attempt to save to DB (will fail silently without crashing)
     conn = safe_get_db_connection()
     if conn:
         try:
@@ -101,7 +98,6 @@ async def upload_pdf(file: UploadFile = File(...)):
             conn.commit()
             cur.close()
             conn.close()
-            # If DB succeeds, link the DB ID to the memory pool as well
             DOCUMENT_CACHE[str(db_id)] = full_text
             generated_id = str(db_id)
         except Exception:
@@ -136,14 +132,12 @@ async def translate_text(request: Request):
     source_text = body.get("source_text") or body.get("sourceText") or body.get("text") or body.get("extracted_text") or body.get("extractedText") or ""
     target_id = body.get("doc_id") or body.get("docId") or body.get("document_id") or body.get("documentId") or body.get("id")
 
-    # Step 1: Check In-Memory Cache first to completely bypass a broken DB
     if not source_text and target_id:
         target_id_str = str(target_id)
         if target_id_str in DOCUMENT_CACHE:
             source_text = DOCUMENT_CACHE[target_id_str]
-            print(f"[CACHE HIT] Successfully pulled text for ID '{target_id_str}' from local memory pool.")
+            print(f"[CACHE HIT] Found text for ID '{target_id_str}' in memory pool.")
 
-    # Step 2: Last-resort fallback to database if memory was cleared
     if not source_text and target_id:
         conn = safe_get_db_connection()
         if conn:
@@ -160,22 +154,23 @@ async def translate_text(request: Request):
 
     if not source_text:
         return {
-            "translatedText": "[System Error: Extracted text could not be found in memory or database. Please try uploading the document again.]",
-            "translated_text": "[System Error: Extracted text could not be found in memory or database. Please try uploading the document again.]",
+            "translatedText": "[System Error: No source text found to translate. Try re-uploading the file.]",
+            "translated_text": "[System Error: No source text found to translate. Try re-uploading the file.]",
             "text": "[Extraction Empty]"
         }
 
     if not GEMINI_API_KEY:
         return {
-            "translatedText": "[Error: GEMINI_API_KEY missing from Render Environment Variables]",
-            "translated_text": "[Error: GEMINI_API_KEY missing from Render Environment Variables]",
+            "translatedText": "[Error: GEMINI_API_KEY environment variable is entirely missing from Render settings]",
+            "translated_text": "[Error: GEMINI_API_KEY environment variable is entirely missing from Render settings]",
             "text": "[Missing API Key]"
         }
 
     translated_text = None
-    api_error_log = "Unknown Model Gateway Error"
+    api_errors = []
 
-    for model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+    # Updated 2026 Production Loop Core
+    for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
             prompt = f"Translate the following text directly into {target_lang}. Preserve layout styling. Do not add chat preamble.\n\nText:\n{source_text}"
@@ -186,9 +181,9 @@ async def translate_text(request: Request):
                 translated_text = response.json()['candidates'][0]['content']['parts'][0]['text']
                 break
             else:
-                api_error_log = f"Google API HTTP {response.status_code}: {response.text}"
+                api_errors.append(f"[{model} Fail -> HTTP {response.status_code}: {response.text}]")
         except Exception as e:
-            api_error_log = str(e)
+            api_errors.append(f"[{model} Exception -> {str(e)}]")
 
     if translated_text:
         return {
@@ -196,9 +191,11 @@ async def translate_text(request: Request):
             "translation": translated_text, "text": translated_text
         }
     else:
+        # Aggregates and logs every single model attempt on the frontend interface
+        combined_errors = " | ".join(api_errors)
         return {
-            "translatedText": f"[Translation Engine Error: {api_error_log}]",
-            "translated_text": f"[Translation Engine Error: {api_error_log}]",
+            "translatedText": f"[Translation Gateway Error Details: {combined_errors}]",
+            "translated_text": f"[Translation Gateway Error Details: {combined_errors}]",
             "text": "[Execution Failure]"
         }
 
