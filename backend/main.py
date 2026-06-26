@@ -1,5 +1,7 @@
 import os
 import io
+import base64
+import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,11 +13,6 @@ try:
     import pytesseract
 except ImportError:
     pytesseract = None
-
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
 
 app = FastAPI()
 
@@ -29,9 +26,6 @@ app.add_middleware(
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if GEMINI_API_KEY and genai:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -63,27 +57,47 @@ async def upload_pdf(file: UploadFile = File(...)):
     for i, img in enumerate(images):
         full_text += f"\n--- PAGE {i+1} ---\n"
         
-        if GEMINI_API_KEY and genai:
+        if GEMINI_API_KEY:
             try:
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                
-                # Convert PIL image safely to raw bytes for cross-version cloud stability
+                # Safely convert the image to base64 layout data string
                 img_byte_arr = io.BytesIO()
                 img.save(img_byte_arr, format='JPEG')
                 img_bytes = img_byte_arr.getvalue()
+                base64_image = base64.b64encode(img_bytes).decode('utf-8')
                 
-                response = model.generate_content([
-                    "Transcribe all handwritten and printed layout text from this document page clearly and accurately. Keep contextual points together.",
-                    {"mime_type": "image/jpeg", "data": img_bytes}
-                ])
-                full_text += response.text + "\n"
-            except Exception as gemini_err:
-                # Instead of hiding the cloud error, display it directly to diagnose setup issues
-                full_text += f"[Gemini Cloud Error: {str(gemini_err)}]\n"
-                full_text += "--- Attempting Local Backup Engine ---\n"
+                # Directly call Google's stable v1 core REST endpoint
+                url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                headers = {'Content-Type': 'application/json'}
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": "Transcribe all handwritten and printed layout text from this document page clearly and accurately. Keep contextual points together."},
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/jpeg",
+                                    "data": base64_image
+                                }
+                            }
+                        ]
+                    }]
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                
+                if response.status_code == 200:
+                    res_data = response.json()
+                    page_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                    full_text += page_text + "\n"
+                else:
+                    full_text += f"[Gemini Cloud Core Error {response.status_code}: {response.text}]\n"
+                    full_text += "--- Attempting Local Backup Engine ---\n"
+                    full_text += fallback_tesseract(img)
+                    
+            except Exception as e:
+                full_text += f"[Connection Interrupted: {str(e)}]\n"
                 full_text += fallback_tesseract(img)
         else:
-            full_text += "[Gemini API Key missing in Render Environment Setup]\n"
+            full_text += "[Gemini API Key missing in Server Settings]\n"
             full_text += fallback_tesseract(img)
             
     doc_id = "temp_pipeline_id"
@@ -116,12 +130,9 @@ def fallback_tesseract(img):
     try:
         if os.path.exists('/usr/bin/tesseract'):
             pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-            
-        # Completely removed the LANCEZOS parameter keyword to avoid library crashes
         max_size = 1500
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size))
-            
         custom_config = r'--psm 11 --oem 3'
         return pytesseract.image_to_string(img, config=custom_config)
     except Exception as e:
@@ -164,18 +175,32 @@ async def translate_text(req: TranslationRequest):
     except Exception:
         pass
 
-    if GEMINI_API_KEY and genai:
+    if GEMINI_API_KEY:
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            headers = {'Content-Type': 'application/json'}
             prompt = f"Translate the following text directly into {req.target_lang}. Preserve layout styling. Do not add chat preamble.\n{memory_context}\nText context:\n{source_text}"
-            response = model.generate_content(prompt)
-            return {
-                "translated_text": response.text,
-                "text": response.text,
-                "translation": response.text
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }]
             }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                res_data = response.json()
+                translated_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                return {
+                    "translated_text": translated_text,
+                    "text": translated_text,
+                    "translation": translated_text
+                }
+            else:
+                raise HTTPException(status_code=500, detail=f"Gemini API translation error: {response.text}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Translation failure: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Translation connection failure: {str(e)}")
     else:
         return {
             "translated_text": "[API Activation Pending Environment Variable Verification]",
