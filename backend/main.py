@@ -1,6 +1,7 @@
 import os
 import io
 import base64
+import uuid
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,13 +27,15 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# FAIL-SAFE IN-MEMORY CACHE (Bypasses broken database connections completely)
+DOCUMENT_CACHE = {}
+
 def safe_get_db_connection():
     if not DATABASE_URL:
         return None
     try:
         return psycopg2.connect(DATABASE_URL)
-    except Exception as e:
-        print(f"Database connection bypass: {str(e)}")
+    except Exception:
         return None
 
 @app.post("/api/upload")
@@ -42,7 +45,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     try:
         images = convert_from_bytes(file_bytes)
-        print(f"[UPLOAD] PDF parsed into {len(images)} pages.")
+        print(f"[UPLOAD] PDF broken down into {len(images)} pages.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse PDF pages: {str(e)}")
     
@@ -81,22 +84,32 @@ async def upload_pdf(file: UploadFile = File(...)):
         else:
             full_text += fallback_tesseract(img)
             
-    doc_id = "temp_id"
+    # Generate a unique tracking ID for this session
+    generated_id = str(uuid.uuid4())[:8]
+    
+    # Save directly to the fail-safe memory cache instantly
+    DOCUMENT_CACHE[generated_id] = full_text
+    print(f"[CACHE] Successfully stored {len(full_text)} characters under memory key: {generated_id}")
+    
+    # Optional background attempt to save to DB (will fail silently without crashing)
     conn = safe_get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
             cur.execute("INSERT INTO documents (file_name, source_text) VALUES (%s, %s) RETURNING id;", (file.filename, full_text))
-            doc_id = str(cur.fetchone()[0])
+            db_id = str(cur.fetchone()[0])
             conn.commit()
             cur.close()
             conn.close()
+            # If DB succeeds, link the DB ID to the memory pool as well
+            DOCUMENT_CACHE[str(db_id)] = full_text
+            generated_id = str(db_id)
         except Exception:
             pass
 
     return {
-        "docId": str(doc_id), "doc_id": str(doc_id),
-        "documentId": str(doc_id), "document_id": str(doc_id), "id": str(doc_id),
+        "docId": str(generated_id), "doc_id": str(generated_id),
+        "documentId": str(generated_id), "document_id": str(generated_id), "id": str(generated_id),
         "sourceText": full_text, "source_text": full_text,
         "extractedText": full_text, "extracted_text": full_text, "text": full_text
     }
@@ -119,25 +132,19 @@ async def translate_text(request: Request):
     except Exception:
         body = {}
 
-    print(f"[TRANSLATE] Full payload received: {body}")
-
-    # 1. Try standard keys
     target_lang = body.get("target_lang") or body.get("targetLang") or "English"
     source_text = body.get("source_text") or body.get("sourceText") or body.get("text") or body.get("extracted_text") or body.get("extractedText") or ""
     target_id = body.get("doc_id") or body.get("docId") or body.get("document_id") or body.get("documentId") or body.get("id")
 
-    # 2. AUTO-DETECT FALLBACK SCANNER: If standard text keys are empty, search through the data structure
-    if not source_text:
-        for key, val in body.items():
-            if isinstance(val, str) and len(val) > 15 and key not in ["target_lang", "targetLang"]:
-                source_text = val
-                print(f"[AUTO-DETECT] Caught source text inside unexpected frontend variable: '{key}'")
-                break
-
-    # 3. DATABASE RECORD FALLBACK CHECK
-    db_status = "Not attempted (Text already found)"
+    # Step 1: Check In-Memory Cache first to completely bypass a broken DB
     if not source_text and target_id:
-        db_status = "Attempted but failed to connect"
+        target_id_str = str(target_id)
+        if target_id_str in DOCUMENT_CACHE:
+            source_text = DOCUMENT_CACHE[target_id_str]
+            print(f"[CACHE HIT] Successfully pulled text for ID '{target_id_str}' from local memory pool.")
+
+    # Step 2: Last-resort fallback to database if memory was cleared
+    if not source_text and target_id:
         conn = safe_get_db_connection()
         if conn:
             try:
@@ -146,32 +153,27 @@ async def translate_text(request: Request):
                 row = cur.fetchone()
                 if row:
                     source_text = row[0]
-                    db_status = "Successfully loaded text from database"
-                else:
-                    db_status = f"Database connected, but ID '{target_id}' was not found"
                 cur.close()
                 conn.close()
-            except Exception as e:
-                db_status = f"Database error encountered: {str(e)}"
+            except Exception:
+                pass
 
-    # 4. IF STILL COMPLETELY EMPTY, SEND BACK DIAGNOSTIC REVELATION
     if not source_text:
-        frontend_keys = list(body.keys())
         return {
-            "translatedText": f"[Diagnostic Log -> Keys Sent by Frontend: {frontend_keys} | DB Status: {db_status}]",
-            "translated_text": f"[Diagnostic Log -> Keys Sent by Frontend: {frontend_keys} | DB Status: {db_status}]",
-            "text": "[Payload Extraction Empty]"
+            "translatedText": "[System Error: Extracted text could not be found in memory or database. Please try uploading the document again.]",
+            "translated_text": "[System Error: Extracted text could not be found in memory or database. Please try uploading the document again.]",
+            "text": "[Extraction Empty]"
         }
 
     if not GEMINI_API_KEY:
         return {
-            "translatedText": "[Error: GEMINI_API_KEY is missing from Render environment variables]",
-            "translated_text": "[Error: GEMINI_API_KEY is missing from Render environment variables]",
+            "translatedText": "[Error: GEMINI_API_KEY missing from Render Environment Variables]",
+            "translated_text": "[Error: GEMINI_API_KEY missing from Render Environment Variables]",
             "text": "[Missing API Key]"
         }
 
     translated_text = None
-    api_error_log = "Unknown Model Error"
+    api_error_log = "Unknown Model Gateway Error"
 
     for model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
         try:
@@ -195,8 +197,8 @@ async def translate_text(request: Request):
         }
     else:
         return {
-            "translatedText": f"[Translation Gateway Error: {api_error_log}]",
-            "translated_text": f"[Translation Gateway Error: {api_error_log}]",
+            "translatedText": f"[Translation Engine Error: {api_error_log}]",
+            "translated_text": f"[Translation Engine Error: {api_error_log}]",
             "text": "[Execution Failure]"
         }
 
