@@ -49,14 +49,13 @@ async def upload_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse PDF pages: {str(e)}")
     
-    full_text = ""
+    raw_extracted_text = ""
     
     for i, img in enumerate(images):
-        full_text += f"\n--- PAGE {i+1} ---\n"
+        raw_extracted_text += f"\n--- PAGE {i+1} ---\n"
         
         if GEMINI_API_KEY:
             page_extracted = False
-            # Updated 2026 Active Production Model List
             for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
                 try:
                     img_byte_arr = io.BytesIO()
@@ -74,31 +73,64 @@ async def upload_pdf(file: UploadFile = File(...)):
                     }
                     response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=30)
                     if response.status_code == 200:
-                        full_text += response.json()['candidates'][0]['content']['parts'][0]['text'] + "\n"
+                        raw_extracted_text += response.json()['candidates'][0]['content']['parts'][0]['text'] + "\n"
                         page_extracted = True
                         break
                 except Exception:
                     continue
             
             if not page_extracted:
-                full_text += fallback_tesseract(img)
+                raw_extracted_text += fallback_tesseract(img)
         else:
-            full_text += fallback_tesseract(img)
+            raw_extracted_text += fallback_tesseract(img)
             
+    # ------------------------------------------------------------------
+    # AUTOMATIC HUMANIZER & CLEANING FILTER
+    # ------------------------------------------------------------------
+    final_polished_text = raw_extracted_text
+    
+    if GEMINI_API_KEY and raw_extracted_text.strip():
+        print("[HUMANIZER] Running text through the automatic cleaning filter...")
+        for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                humanizer_prompt = (
+                    "You are an expert educational copyeditor. Take the following raw, messy OCR text "
+                    "extracted from a document and rewrite it into a highly readable, humanized, and beautifully "
+                    "structured study guide.\n\n"
+                    "Rules:\n"
+                    "1. Strip out all unnecessary special characters, arrows, repetitive speech bubble markers, and stray symbols (like ↑, ↗, ↳, ★, ▲, Ⓟ).\n"
+                    "2. Fix broken words, spelling mistakes, and bad layout breaks caused by extraction.\n"
+                    "3. Organize the text into logical sections using clean Markdown layout (## for main headings, ### for subheadings, clean bullets).\n"
+                    "4. Use bolding (**text**) for important historical terms, names, and events.\n"
+                    "5. Do not lose any factual information, names, dates, or context.\n\n"
+                    f"Raw Text to Clean:\n{raw_extracted_text}"
+                )
+                payload = {"contents": [{"parts": [{"text": humanizer_prompt}]}]}
+                response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=45)
+                if response.status_code == 200:
+                    final_polished_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                    print("[HUMANIZER] Text successfully cleaned and formatted.")
+                    break
+            except Exception as e:
+                print(f"[HUMANIZER] Model {model} pass failed, trying backup: {str(e)}")
+                continue
+
+    # Store the beautifully cleaned text instead of the messy raw text
     generated_id = str(uuid.uuid4())[:8]
-    DOCUMENT_CACHE[generated_id] = full_text
-    print(f"[CACHE] Stored document under memory key: {generated_id}")
+    DOCUMENT_CACHE[generated_id] = final_polished_text
+    print(f"[CACHE] Stored cleaned document under key: {generated_id}")
     
     conn = safe_get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
-            cur.execute("INSERT INTO documents (file_name, source_text) VALUES (%s, %s) RETURNING id;", (file.filename, full_text))
+            cur.execute("INSERT INTO documents (file_name, source_text) VALUES (%s, %s) RETURNING id;", (file.filename, final_polished_text))
             db_id = str(cur.fetchone()[0])
             conn.commit()
             cur.close()
             conn.close()
-            DOCUMENT_CACHE[str(db_id)] = full_text
+            DOCUMENT_CACHE[str(db_id)] = final_polished_text
             generated_id = str(db_id)
         except Exception:
             pass
@@ -106,8 +138,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     return {
         "docId": str(generated_id), "doc_id": str(generated_id),
         "documentId": str(generated_id), "document_id": str(generated_id), "id": str(generated_id),
-        "sourceText": full_text, "source_text": full_text,
-        "extractedText": full_text, "extracted_text": full_text, "text": full_text
+        "sourceText": final_polished_text, "source_text": final_polished_text,
+        "extractedText": final_polished_text, "extracted_text": final_polished_text, "text": final_polished_text
     }
 
 def fallback_tesseract(img):
@@ -169,7 +201,6 @@ async def translate_text(request: Request):
     translated_text = None
     api_errors = []
 
-    # Updated 2026 Production Loop Core
     for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -191,7 +222,6 @@ async def translate_text(request: Request):
             "translation": translated_text, "text": translated_text
         }
     else:
-        # Aggregates and logs every single model attempt on the frontend interface
         combined_errors = " | ".join(api_errors)
         return {
             "translatedText": f"[Translation Gateway Error Details: {combined_errors}]",
