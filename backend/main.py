@@ -27,8 +27,9 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# FAIL-SAFE IN-MEMORY CACHE
+# FAIL-SAFE IN-MEMORY CACHES
 DOCUMENT_CACHE = {}
+LAST_UPLOADED_TEXT = ""  # Ultimate fallback safety net
 
 def safe_get_db_connection():
     if not DATABASE_URL:
@@ -40,6 +41,7 @@ def safe_get_db_connection():
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    global LAST_UPLOADED_TEXT
     print(f"\n[UPLOAD] File Received: {file.filename}")
     file_bytes = await file.read()
     
@@ -84,9 +86,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         else:
             raw_extracted_text += fallback_tesseract(img)
             
-    # ------------------------------------------------------------------
     # AUTOMATIC HUMANIZER & CLEANING FILTER
-    # ------------------------------------------------------------------
     final_polished_text = raw_extracted_text
     
     if GEMINI_API_KEY and raw_extracted_text.strip():
@@ -101,7 +101,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                     "Rules:\n"
                     "1. Strip out all unnecessary special characters, arrows, repetitive speech bubble markers, and stray symbols (like ↑, ↗, ↳, ★, ▲, Ⓟ).\n"
                     "2. Fix broken words, spelling mistakes, and bad layout breaks caused by extraction.\n"
-                    "3. Organize the text into logical sections using clean Markdown layout (## for main headings, ### for subheadings, clean bullets).\n"
+                    "3. Organize the text into logical sections using clean Markdown layout (## for main headings, ### for subheadings).\n"
                     "4. Use bolding (**text**) for important historical terms, names, and events.\n"
                     "5. Do not lose any factual information, names, dates, or context.\n\n"
                     f"Raw Text to Clean:\n{raw_extracted_text}"
@@ -116,10 +116,12 @@ async def upload_pdf(file: UploadFile = File(...)):
                 print(f"[HUMANIZER] Model {model} pass failed, trying backup: {str(e)}")
                 continue
 
-    # Store the beautifully cleaned text instead of the messy raw text
+    # Save to global safety net variable
+    LAST_UPLOADED_TEXT = final_polished_text
+
+    # Store in memory cache
     generated_id = str(uuid.uuid4())[:8]
     DOCUMENT_CACHE[generated_id] = final_polished_text
-    print(f"[CACHE] Stored cleaned document under key: {generated_id}")
     
     conn = safe_get_db_connection()
     if conn:
@@ -154,6 +156,7 @@ def fallback_tesseract(img):
 
 @app.post("/api/translate")
 async def translate_text(request: Request):
+    global LAST_UPLOADED_TEXT
     print("\n[TRANSLATE] Inbound request intercepted.")
     try:
         body = await request.json()
@@ -161,15 +164,31 @@ async def translate_text(request: Request):
         body = {}
 
     target_lang = body.get("target_lang") or body.get("targetLang") or "English"
-    source_text = body.get("source_text") or body.get("sourceText") or body.get("text") or body.get("extracted_text") or body.get("extractedText") or ""
-    target_id = body.get("doc_id") or body.get("docId") or body.get("document_id") or body.get("documentId") or body.get("id")
+    
+    # Check every possible data key the frontend might be sending text under
+    source_text = (
+        body.get("source_text") or body.get("sourceText") or 
+        body.get("text") or body.get("extracted_text") or 
+        body.get("extractedText") or body.get("content") or 
+        body.get("source") or body.get("original") or ""
+    )
+    
+    # Check every possible data key the frontend might be sending an ID under
+    target_id = (
+        body.get("doc_id") or body.get("docId") or 
+        body.get("document_id") or body.get("documentId") or 
+        body.get("id") or body.get("document") or 
+        body.get("fileId") or body.get("file_id")
+    )
 
+    # Lookup by ID in cache if text wasn't directly passed
     if not source_text and target_id:
         target_id_str = str(target_id)
         if target_id_str in DOCUMENT_CACHE:
             source_text = DOCUMENT_CACHE[target_id_str]
             print(f"[CACHE HIT] Found text for ID '{target_id_str}' in memory pool.")
 
+    # Lookup by ID in DB if cache missed
     if not source_text and target_id:
         conn = safe_get_db_connection()
         if conn:
@@ -183,6 +202,11 @@ async def translate_text(request: Request):
                 conn.close()
             except Exception:
                 pass
+
+    # CRITICAL SAFETY NET: If text is still empty, fall back to the document that was just processed
+    if not source_text and LAST_UPLOADED_TEXT:
+        print("[SAFETY NET] Text mapping missing. Defaulting to last processed file upload.")
+        source_text = LAST_UPLOADED_TEXT
 
     if not source_text:
         return {
